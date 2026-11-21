@@ -13,6 +13,7 @@
 | M5 分区判定 | 查看并运行分区判定 | `/api/partitions` | `app/modules/m5_partitions/rules.py` | `tests/test_m5.py` |
 | M6 访问对账 | 查看并运行访问对账 | `/api/audit` | `app/modules/m6_audit/rules.py` | `tests/test_m6.py` |
 | M7 审计归档 | 查看并运行审计归档 | `/api/seals` | `app/modules/m7_seals/rules.py` | `tests/test_m7.py` |
+| M8 特征回收 | 生成回收单并导出证据 | `/api/reclaims` | `app/modules/m8_reclaims/rules.py` | `tests/test_m8.py` |
 
 ## 陷阱登记
 
@@ -29,6 +30,11 @@
 | TRAP-07 | 上游结果空值 | 误报拒绝 | 隔离缺失 | `app/values.py` | `tests/test_m3.py::test_real_missing_decision_not_zero` |
 | TRAP-19 | 允许与拒绝重叠 | 后写覆盖 | 拒绝优先且排序证据 | `app/modules/m4_conflicts/rules.py` | `tests/test_m4.py::test_deny_priority_counterexample` |
 | TRAP-23 | 授权到期点 | 多放行一次 | 半开生效窗 | `app/modules/m3_grants/rules.py` | `tests/test_m3.py::test_expiry_endpoint_excluded` |
+| TRAP-27 | 共享分区单授权到期 | 整套版本撤回，中断在用样本与评估 | 逐样本裁决、版本内分组，授权内样本保留 | `app/modules/m8_reclaims/rules.py` | `tests/test_m8.py::test_real_sample_mixed_version_ruled_per_sample` |
+| TRAP-28 | 同版本重试 | 重复生成回收单 | order_id版本派生+指纹幂等 | `app/store.py` | `tests/test_m8.py::test_retry_does_not_add_order` |
+| TRAP-29 | 结论切换冲突 | 旧版与授权依据被覆盖丢失 | 版本条件更新+历史表，失败409保留旧版 | `app/store.py` | `tests/test_m8.py::test_stale_switch_keeps_old_version_and_basis` |
+| TRAP-30 | 证据导出重算 | 导出结论与签核结论漂移 | 直接读取已落库回收单 | `app/modules/m8_reclaims/handler.py` | `tests/test_m8.py::test_evidence_follows_stored_conclusion` |
+| TRAP-31 | 采集时刻与裁决时刻混用 | 到期授权仍判有效 | 双时刻复算，裁决时刻状态逐授权标注 | `app/modules/m8_reclaims/rules.py` | `tests/test_m8.py::test_expiry_endpoint_excluded_half_open` |
 
 ## 对账规则
 

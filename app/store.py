@@ -1,4 +1,5 @@
 import sqlite3,json
+from datetime import datetime,timezone
 from pathlib import Path
 from app.config import DATA_DIR
 from app.errors import DomainError
@@ -7,6 +8,8 @@ def connect():
     db=sqlite3.connect(DATA_DIR/"records.db",timeout=20)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY,payload TEXT NOT NULL,version INTEGER NOT NULL DEFAULT 1,decision TEXT NOT NULL DEFAULT '待复核')")
+    db.execute("CREATE TABLE IF NOT EXISTS reclaim_orders (order_id TEXT PRIMARY KEY,feature_version TEXT NOT NULL UNIQUE,payload TEXT NOT NULL,fingerprint TEXT NOT NULL,version INTEGER NOT NULL DEFAULT 1,decision TEXT NOT NULL DEFAULT '待复核',run_id TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS reclaim_order_history (id INTEGER PRIMARY KEY AUTOINCREMENT,order_id TEXT NOT NULL,version INTEGER NOT NULL,decision TEXT NOT NULL,payload TEXT NOT NULL,archived_at TEXT NOT NULL)")
     return db
 def save(run_id,payload):
     with connect() as db:
@@ -29,3 +32,58 @@ def review(run_id,version,decision):
             if not db.execute("SELECT 1 FROM runs WHERE id=?",(run_id,)).fetchone(): raise DomainError("NOT_FOUND","批次不存在",404)
             raise DomainError("STALE_VERSION","版本已更新，请刷新",409)
     return get(run_id)
+def _reclaim_row(db,order_id):
+    row=db.execute("SELECT payload,version,decision FROM reclaim_orders WHERE order_id=?",(order_id,)).fetchone()
+    if not row: raise DomainError("NOT_FOUND","回收单不存在",404)
+    return {**json.loads(row[0]),"version":row[1],"decision":row[2]}
+def get_reclaim_order(order_id):
+    with connect() as db: return _reclaim_row(db,order_id)
+def get_reclaim_order_by_version(feature_version):
+    with connect() as db:
+        row=db.execute("SELECT order_id FROM reclaim_orders WHERE feature_version=?",(feature_version,)).fetchone()
+        return _reclaim_row(db,row[0]) if row else None
+def reclaim_orders():
+    with connect() as db:
+        out=[]
+        for o,v,n,d,p,u in db.execute("SELECT order_id,feature_version,version,decision,payload,updated_at FROM reclaim_orders ORDER BY rowid"):
+            body=json.loads(p)
+            out.append({"order_id":o,"feature_version":v,"version":n,"decision":d,"ruling":body["ruling"],
+                        "withdraw_count":body["withdraw_count"],"retain_count":body["retain_count"],
+                        "sample_count":body["sample_count"],"as_of":body["as_of"],"updated_at":u})
+        return out
+def reclaim_history(order_id):
+    with connect() as db:
+        if not db.execute("SELECT 1 FROM reclaim_orders WHERE order_id=?",(order_id,)).fetchone(): raise DomainError("NOT_FOUND","回收单不存在",404)
+        return [{"order_id":o,"version":v,"decision":d,"archived_at":a,"payload":json.loads(p)}
+                for o,v,d,p,a in db.execute("SELECT order_id,version,decision,payload,archived_at FROM reclaim_order_history WHERE order_id=? ORDER BY id",(order_id,))]
+def save_reclaim_order(order,fingerprint,run_id=None,expected_version=None,decision="待复核"):
+    "同一特征版本唯一回收单：相同结论重试幂等；切换结论走版本条件更新，失败保留旧版与原授权依据"
+    now=datetime.now(timezone.utc).isoformat()
+    with connect() as db:
+        existing=db.execute("SELECT order_id,version,payload,fingerprint FROM reclaim_orders WHERE order_id=?",(order["order_id"],)).fetchone()
+        if not existing:
+            db.execute("INSERT INTO reclaim_orders(order_id,feature_version,payload,fingerprint,version,decision,run_id,created_at,updated_at) VALUES (?,?,?,?,1,?,?,?,?)",
+                       (order["order_id"],order["feature_version"],json.dumps(order,ensure_ascii=False),fingerprint,decision,run_id,now,now))
+            return _reclaim_row(db,order["order_id"])
+        if existing[3]==fingerprint:
+            return _reclaim_row(db,order["order_id"])
+        base=expected_version if expected_version is not None else existing[1]
+        cursor=db.execute("UPDATE reclaim_orders SET payload=?,fingerprint=?,version=version+1,decision=?,run_id=COALESCE(?,run_id),updated_at=? WHERE order_id=? AND version=?",
+                          (json.dumps(order,ensure_ascii=False),fingerprint,decision,run_id,now,order["order_id"],base))
+        if cursor.rowcount!=1:
+            if not db.execute("SELECT 1 FROM reclaim_orders WHERE order_id=?",(order["order_id"],)).fetchone(): raise DomainError("NOT_FOUND","回收单不存在",404)
+            raise DomainError("STALE_VERSION","回收单版本已更新，旧版与原授权依据已保留",409)
+        db.execute("INSERT INTO reclaim_order_history(order_id,version,decision,payload,archived_at) VALUES (?,?,?,?,?)",
+                   (order["order_id"],existing[1],"已被新版替换",existing[2],now))
+        return _reclaim_row(db,order["order_id"])
+def review_reclaim_order(order_id,version,decision):
+    if decision not in {"已复核","退回复核"}: raise DomainError("BAD_DECISION","复核状态无效")
+    with connect() as db:
+        old=db.execute("SELECT payload FROM reclaim_orders WHERE order_id=?",(order_id,)).fetchone()
+        if not old: raise DomainError("NOT_FOUND","回收单不存在",404)
+        cursor=db.execute("UPDATE reclaim_orders SET version=version+1,decision=?,updated_at=? WHERE order_id=? AND version=?",
+                          (decision,datetime.now(timezone.utc).isoformat(),order_id,version))
+        if cursor.rowcount!=1: raise DomainError("STALE_VERSION","回收单版本已更新，旧版与原授权依据已保留",409)
+        db.execute("INSERT INTO reclaim_order_history(order_id,version,decision,payload,archived_at) VALUES (?,?,?,?,?)",
+                   (order_id,version,decision,old[0],datetime.now(timezone.utc).isoformat()))
+        return _reclaim_row(db,order_id)
